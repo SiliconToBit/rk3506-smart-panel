@@ -1,0 +1,45 @@
+CompileFlags:
+  # 指定编译数据库位置
+  CompilationDatabase: build/
+  
+  # 添加额外标志
+  Add:
+    # 忽略未知警告选项（交叉编译工具链特有警告）
+    - -Wno-unknown-warning-option
+    # 忽略 pragma once 在主文件中的警告
+    - -Wno-pragma-once-outside-header
+  
+  # 移除可能导致问题的标志
+  Remove:
+    # 移除 psabi 警告（已在 CMakeLists.txt 中处理）
+    - -Wpsabi
+
+# 索引配置
+Index:
+  # 后台索引以加快响应速度
+  Background: Build
+  
+# 诊断配置
+Diagnostics:
+  # 启用 clang-tidy 检查
+  ClangTidy:
+    Add:
+      - modernize-*
+      - readability-*
+      - performance-*
+    Remove:
+      - modernize-use-trailing-return-type
+      - readability-magic-numbers
+  # 不显示来自系统头文件的诊断信息
+  UnusedIncludes: Strict
+  MissingIncludes: None
+
+# 代码补全配置
+Completion:
+  # 所有作用域符号都参与补全
+  AllScopes: Yes
+
+# 悬停信息配置
+Hover:
+  # 显示更详细的类型信息
+  ShowAKA: Yes
