@@ -29,8 +29,10 @@ rk3506-smart-panel/
 │   │   └── WeatherApp.h    # 天气应用
 │   ├── hal/                # 硬件抽象层
 │   │   ├── AudioPlayer.h   # 音频播放器
+│   │   ├── CpuAffinity.h   # CPU 亲和性管理
 │   │   ├── DeviceNode.h    # 设备节点基类
 │   │   ├── HttpClient.h    # HTTP 客户端
+│   │   ├── ThreadPool.h    # 线程池
 │   │   └── VideoPlayer.h   # 视频播放器
 │   ├── sensor/             # 传感器驱动
 │   │   ├── Buzzer.h        # 蜂鸣器驱动
@@ -146,9 +148,11 @@ make distclean
 
 | 模块 | 说明 |
 |------|------|
-| `AudioPlayer` | 基于 FFmpeg + ALSA 的音频播放器 |
+| `AudioPlayer` | 基于 FFmpeg + ALSA 的音频播放器 ([详细设计](docs/AudioPlayer_Design.md)) |
 | `VideoPlayer` | 视频播放器封装 |
-| `HttpClient` | HTTP 客户端，用于 API 请求 |
+| `HttpClient` | HTTP 客户端，使用线程池管理异步请求 |
+| `CpuAffinity` | CPU 亲和性管理工具 |
+| `ThreadPool` | 轻量级线程池实现 |
 | `DeviceNode` | 字符设备节点基类 |
 
 ### 传感器层 (sensor)
@@ -167,7 +171,7 @@ make distclean
 - **构建系统**: CMake
 - **音视频**: FFmpeg + ALSA
 - **网络**: cURL
-- **多线程**: pthread
+- **多线程**: pthread + std::thread + 线程池
 
 ## 架构设计
 
@@ -181,6 +185,7 @@ make distclean
 ├─────────────────────────────────────────────────────┤
 │              Hardware Abstraction Layer              │
 │    AudioPlayer  │  VideoPlayer  │  HttpClient  │    │
+│              ThreadPool  │  CpuAffinity             │
 ├─────────────────────────────────────────────────────┤
 │                   Driver Layer                       │
 │      DHT11  │  MPU6050  │  Buzzer  │  LED  │  ...   │
@@ -188,6 +193,50 @@ make distclean
 │                   Linux Kernel                       │
 │              /dev/dht11, /dev/mpu6050, ...           │
 └─────────────────────────────────────────────────────┘
+```
+
+## 线程模型
+
+### 线程与 CPU 亲和性
+
+| 线程 | CPU 绑定 | 说明 |
+|------|----------|------|
+| 主线程 (UI) | CPU1 | LVGL 刷新循环 |
+| 音频解码 | CPU0 | FFmpeg 解码 + ALSA 输出 |
+| 视频解码 | CPU2 | FFmpeg 视频解码 |
+| 视频内置音频 | CPU2 | 与视频解码同核心 |
+| HTTP 异步请求 | CPU0 | 线程池工作线程 (2个) |
+| LVGL 输入设备 | 不绑定 | 触摸/按键事件读取 |
+
+### 线程池
+
+HTTP 异步请求使用线程池管理，避免频繁创建/销毁线程：
+
+```cpp
+// 线程池配置
+ThreadPool(2, selectHttpCpu(), "HttpWorker")
+// 2个工作线程，绑定到 CPU0，线程名称前缀 "HttpWorker"
+```
+
+### CPU 亲和性工具
+
+使用 `hal::CpuAffinity` 统一管理线程 CPU 绑定：
+
+```cpp
+// 绑定 std::thread
+hal::bindThreadToCpu(thread, cpuId, "ThreadName");
+
+// 绑定当前线程（用于 std::async 内部）
+hal::bindCurrentThreadToCpu(cpuId, "ThreadName");
+
+// 设置线程优先级
+hal::setThreadPriority(thread, SCHED_FIFO, priority, "ThreadName");
+
+// 获取推荐 CPU
+hal::selectAudioCpu();   // 音频推荐 CPU0
+hal::selectVideoCpu();   // 视频推荐 CPU2 (3核+)
+hal::selectUiCpu();      // UI 推荐 CPU1
+hal::selectHttpCpu();    // HTTP 推荐 CPU0
 ```
 
 ## 注意事项
