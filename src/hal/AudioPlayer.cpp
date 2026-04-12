@@ -84,6 +84,7 @@ namespace hal
         if (m_isPaused)
         {
             m_isPaused = false;
+            notifyPauseCondition();
         }
     }
 
@@ -139,6 +140,13 @@ namespace hal
 
         // 刷新解码器缓冲区
         avcodec_flush_buffers(m_codecCtx.get());
+
+        // 排空 ALSA 缓冲区，避免 Seek 后播放残留的旧数据
+        if (m_pcmHandle)
+        {
+            snd_pcm_drop(m_pcmHandle.get());
+            snd_pcm_prepare(m_pcmHandle.get());
+        }
 
         // 更新当前 PTS
         m_currentPts = positionSeconds;
@@ -307,7 +315,20 @@ namespace hal
         snd_pcm_sframes_t framesWritten = snd_pcm_writei(m_pcmHandle.get(), outBuffer, sampleCount);
         if (framesWritten < 0)
         {
-            snd_pcm_recover(m_pcmHandle.get(), framesWritten, 1);
+            const int recoverRet = snd_pcm_recover(m_pcmHandle.get(), framesWritten, 1);
+            if (recoverRet < 0)
+            {
+                notifyError("ALSA recover failed: " + std::string(snd_strerror(recoverRet)));
+            }
+            else
+            {
+                // 恢复成功后重新写入
+                framesWritten = snd_pcm_writei(m_pcmHandle.get(), outBuffer, sampleCount);
+                if (framesWritten < 0)
+                {
+                    notifyError("ALSA write failed after recover: " + std::string(snd_strerror(framesWritten)));
+                }
+            }
         }
     }
 
@@ -383,11 +404,13 @@ namespace hal
 
         while (!m_stopRequested)
         {
-            // 暂停处理
+            // 暂停处理（使用条件变量等待，避免轮询延迟）
             if (m_isPaused)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
+                if (!waitForResumeOrStop())
+                {
+                    break; // 收到停止请求
+                }
             }
 
             // 1. 读取一帧数据
@@ -410,6 +433,18 @@ namespace hal
         }
 
         m_isPlaying = false;
+    }
+
+    bool AudioPlayer::waitForResumeOrStop()
+    {
+        std::unique_lock<std::mutex> lock(m_pauseMutex);
+        m_pauseCondition.wait(lock, [this]() { return !m_isPaused.load() || m_stopRequested.load(); });
+        return !m_stopRequested.load();
+    }
+
+    void AudioPlayer::notifyPauseCondition()
+    {
+        m_pauseCondition.notify_one();
     }
 
     void AudioPlayer::cleanup()
