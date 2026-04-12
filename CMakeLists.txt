@@ -108,7 +108,7 @@ add_custom_target(distclean
 
 # --- 编译选项 ---
 # 设为 OFF 可在无开发板时编译（跳过自动部署）
-option(ENABLE_AUTO_DEPLOY "Enable auto-deploy to target board" ON)
+option(ENABLE_AUTO_DEPLOY "Enable auto-deploy to target board" OFF)
 
 # --- 安装配置 ---
 set(OVERLAY_ROOT_DIR $ENV{RK3506_OVERLAY_DIR})

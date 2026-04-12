@@ -1,58 +1,9 @@
 #include "VideoPlayer.h"
+#include "hal/CpuAffinity.h"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 #include <thread>
-
-namespace
-{
-    int get_online_cpus()
-    {
-        const long online = sysconf(_SC_NPROCESSORS_ONLN);
-        return online > 0 ? static_cast<int>(online) : 1;
-    }
-
-    int select_video_cpu()
-    {
-        const int onlineCpus = get_online_cpus();
-        if (onlineCpus >= 3)
-        {
-            return 2;
-        }
-        if (onlineCpus >= 2)
-        {
-            return 0;
-        }
-        return 0;
-    }
-
-    void bind_thread_to_cpu_if_possible(std::thread& thread, int cpuId, const char* threadName)
-    {
-        if (!thread.joinable())
-        {
-            return;
-        }
-
-        const int onlineCpus = get_online_cpus();
-        if (cpuId < 0 || cpuId >= onlineCpus)
-        {
-            return;
-        }
-
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cpuId, &set);
-
-        const int ret = pthread_setaffinity_np(thread.native_handle(), sizeof(set), &set);
-        if (ret != 0)
-        {
-            std::cerr << "[CPU] Failed to bind " << threadName << " to CPU " << cpuId << ": " << ret << '\n';
-        }
-    }
-} // namespace
 
 namespace hal
 {
@@ -63,6 +14,8 @@ namespace hal
     VideoPlayer::VideoPlayer()
         : m_internalAudioPlayer(std::make_unique<AudioPlayer>())
     {
+        // 让内部音频播放器使用与视频相同的CPU亲和性
+        m_internalAudioPlayer->setCpuAffinity(selectVideoCpu());
     }
 
     VideoPlayer::~VideoPlayer()
@@ -92,7 +45,7 @@ namespace hal
 
         // 启动视频解码线程
         m_decodeThread = std::thread(&VideoPlayer::decodeLoop, this);
-        bind_thread_to_cpu_if_possible(m_decodeThread, select_video_cpu(), "VideoDecode");
+        bindThreadToCpu(m_decodeThread, selectVideoCpu(), "VideoDecode");
 
         // 如果有音频，启动音频播放
         if (m_hasAudio)

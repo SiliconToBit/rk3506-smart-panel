@@ -1,54 +1,9 @@
 #include "AudioPlayer.h"
+#include "hal/CpuAffinity.h"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 #include <thread>
-
-namespace
-{
-    int get_online_cpus()
-    {
-        const long online = sysconf(_SC_NPROCESSORS_ONLN);
-        return online > 0 ? static_cast<int>(online) : 1;
-    }
-
-    int select_audio_cpu()
-    {
-        const int onlineCpus = get_online_cpus();
-        if (onlineCpus >= 1)
-        {
-            return 0;
-        }
-        return 0;
-    }
-
-    void bind_thread_to_cpu_if_possible(std::thread& thread, int cpuId, const char* threadName)
-    {
-        if (!thread.joinable())
-        {
-            return;
-        }
-
-        const int onlineCpus = get_online_cpus();
-        if (cpuId < 0 || cpuId >= onlineCpus)
-        {
-            return;
-        }
-
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cpuId, &set);
-
-        const int ret = pthread_setaffinity_np(thread.native_handle(), sizeof(set), &set);
-        if (ret != 0)
-        {
-            std::cerr << "[CPU] Failed to bind " << threadName << " to CPU " << cpuId << ": " << ret << '\n';
-        }
-    }
-} // namespace
 
 namespace hal
 {
@@ -87,7 +42,10 @@ namespace hal
 
         // 3. 启动解码线程 (C++11 起，std::thread 直接移动)
         m_decodeThread = std::thread(&AudioPlayer::decodeLoop, this);
-        bind_thread_to_cpu_if_possible(m_decodeThread, select_audio_cpu(), "AudioDecode");
+
+        // 使用自定义CPU亲和性或默认值
+        const int targetCpu = (m_cpuAffinity >= 0) ? m_cpuAffinity : selectAudioCpu();
+        bindThreadToCpu(m_decodeThread, targetCpu, "AudioDecode");
 
         return true;
     }
@@ -208,6 +166,11 @@ namespace hal
     {
         std::lock_guard<std::mutex> lock(m_callbackMutex);
         m_onError = std::move(callback);
+    }
+
+    void AudioPlayer::setCpuAffinity(int cpuId)
+    {
+        m_cpuAffinity = cpuId;
     }
 
     // ==========================================

@@ -62,6 +62,9 @@ namespace hal
         void setOnPlaybackComplete(PlaybackCallback callback);
         void setOnError(ErrorCallback callback);
 
+        // 设置CPU亲和性（必须在play()之前调用）
+        void setCpuAffinity(int cpuId);
+
     private:
         static constexpr int kOutputChannels = 2;
         static constexpr int kOutputSampleRate = 44100;
@@ -125,6 +128,9 @@ namespace hal
 
         // 音量
         std::atomic<float> m_volume{1.0F};
+
+        // CPU亲和性设置
+        int m_cpuAffinity{-1}; // -1表示使用默认CPU
 
         // 解码线程
         std::thread m_decodeThread;

@@ -6,8 +6,8 @@
 #include <mutex>
 #include <optional>
 #include <map>
-#include <future>
 #include <atomic>
+#include "ThreadPool.h"
 
 namespace hal
 {
@@ -147,9 +147,8 @@ namespace hal
         std::mutex m_headerMutex;
         std::function<void(const std::string&)> m_onError;
 
-        // 异步请求管理
-        std::vector<std::future<void>> m_asyncTasks;
-        std::mutex m_threadMutex;
+        // 线程池管理异步请求
+        std::unique_ptr<ThreadPool> m_threadPool;
         std::atomic<bool> m_shutdown{false};
     };
 

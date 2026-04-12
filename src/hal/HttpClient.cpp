@@ -1,38 +1,9 @@
 #include "HttpClient.h"
+#include "hal/CpuAffinity.h"
 #include <curl/curl.h>
 #include <chrono>
 #include <iostream>
 #include <algorithm>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
-
-namespace
-{
-    int get_online_cpus()
-    {
-        const long online = sysconf(_SC_NPROCESSORS_ONLN);
-        return online > 0 ? static_cast<int>(online) : 1;
-    }
-
-    void bind_current_thread_to_cpu0_if_possible()
-    {
-        if (get_online_cpus() <= 0)
-        {
-            return;
-        }
-
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(0, &set);
-
-        const int ret = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-        if (ret != 0)
-        {
-            std::cerr << "[CPU] Failed to bind HttpAsync to CPU 0: " << ret << '\n';
-        }
-    }
-} // namespace
 
 namespace hal
 {
@@ -65,33 +36,16 @@ namespace hal
             curl_global_init(CURL_GLOBAL_DEFAULT);
             curlInitialized = true;
         }
+
+        // 创建线程池（2个线程，绑定到HTTP推荐CPU）
+        m_threadPool = std::make_unique<ThreadPool>(2, selectHttpCpu(), "HttpWorker");
     }
 
     HttpClient::~HttpClient()
     {
         m_shutdown = true;
-
-        std::vector<std::future<void>> pendingTasks;
-        {
-            std::lock_guard<std::mutex> lock(m_threadMutex);
-            pendingTasks.swap(m_asyncTasks);
-        }
-
-        // 等待所有异步任务完成
-        for (auto& task : pendingTasks)
-        {
-            if (task.valid())
-            {
-                task.wait();
-                try
-                {
-                    task.get();
-                }
-                catch (...)
-                {
-                }
-            }
-        }
+        // 线程池析构时会自动等待所有任务完成
+        m_threadPool.reset();
     }
 
     // ==========================================
@@ -125,121 +79,59 @@ namespace hal
 
     void HttpClient::getAsync(const std::string& url, ResponseCallback callback)
     {
-        std::lock_guard<std::mutex> lock(m_threadMutex);
+        m_threadPool->submit(
+            [this, url, callback = std::move(callback)]() mutable
+            {
+                if (m_shutdown.load())
+                {
+                    return;
+                }
 
-        // 非阻塞清理已完成的任务，避免在 UI 线程调用时卡顿
-        m_asyncTasks.erase(std::remove_if(m_asyncTasks.begin(), m_asyncTasks.end(),
-                                          [](std::future<void>& task)
-                                          {
-                                              if (!task.valid())
-                                              {
-                                                  return true;
-                                              }
+                auto response = get(url);
 
-                                              if (task.wait_for(std::chrono::milliseconds(0)) ==
-                                                  std::future_status::ready)
-                                              {
-                                                  try
-                                                  {
-                                                      task.get();
-                                                  }
-                                                  catch (...)
-                                                  {
-                                                  }
-                                                  return true;
-                                              }
+                if (m_shutdown.load())
+                {
+                    return;
+                }
 
-                                              return false;
-                                          }),
-                           m_asyncTasks.end());
-
-        // 启动新异步任务
-        m_asyncTasks.emplace_back(std::async(std::launch::async,
-                                             [this, url, callback = std::move(callback)]() mutable
-                                             {
-                                                 bind_current_thread_to_cpu0_if_possible();
-
-                                                 if (m_shutdown.load())
-                                                 {
-                                                     return;
-                                                 }
-
-                                                 auto response = get(url);
-
-                                                 if (m_shutdown.load())
-                                                 {
-                                                     return;
-                                                 }
-
-                                                 if (response)
-                                                 {
-                                                     callback(200, *response);
-                                                 }
-                                                 else
-                                                 {
-                                                     callback(-1, "");
-                                                 }
-                                             }));
+                if (response)
+                {
+                    callback(200, *response);
+                }
+                else
+                {
+                    callback(-1, "");
+                }
+            });
     }
 
     void HttpClient::postAsync(const std::string& url, const std::string& body, ResponseCallback callback,
                                const std::string& contentType)
     {
-        std::lock_guard<std::mutex> lock(m_threadMutex);
+        m_threadPool->submit(
+            [this, url, body, contentType, callback = std::move(callback)]() mutable
+            {
+                if (m_shutdown.load())
+                {
+                    return;
+                }
 
-        // 非阻塞清理已完成的任务，避免在 UI 线程调用时卡顿
-        m_asyncTasks.erase(std::remove_if(m_asyncTasks.begin(), m_asyncTasks.end(),
-                                          [](std::future<void>& task)
-                                          {
-                                              if (!task.valid())
-                                              {
-                                                  return true;
-                                              }
+                auto response = post(url, body, contentType);
 
-                                              if (task.wait_for(std::chrono::milliseconds(0)) ==
-                                                  std::future_status::ready)
-                                              {
-                                                  try
-                                                  {
-                                                      task.get();
-                                                  }
-                                                  catch (...)
-                                                  {
-                                                  }
-                                                  return true;
-                                              }
+                if (m_shutdown.load())
+                {
+                    return;
+                }
 
-                                              return false;
-                                          }),
-                           m_asyncTasks.end());
-
-        // 启动新异步任务
-        m_asyncTasks.emplace_back(std::async(std::launch::async,
-                                             [this, url, body, contentType, callback = std::move(callback)]() mutable
-                                             {
-                                                 bind_current_thread_to_cpu0_if_possible();
-
-                                                 if (m_shutdown.load())
-                                                 {
-                                                     return;
-                                                 }
-
-                                                 auto response = post(url, body, contentType);
-
-                                                 if (m_shutdown.load())
-                                                 {
-                                                     return;
-                                                 }
-
-                                                 if (response)
-                                                 {
-                                                     callback(200, *response);
-                                                 }
-                                                 else
-                                                 {
-                                                     callback(-1, "");
-                                                 }
-                                             }));
+                if (response)
+                {
+                    callback(200, *response);
+                }
+                else
+                {
+                    callback(-1, "");
+                }
+            });
     }
 
     // ==========================================
