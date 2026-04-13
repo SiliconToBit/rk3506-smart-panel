@@ -1,23 +1,22 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <type_traits>
 
-extern "C"
+namespace hal
 {
-#include <alsa/asoundlib.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/opt.h>
-#include <libswresample/swresample.h>
-}
+    class AudioDecoder;
+    class AudioOutput;
+} // namespace hal
 
 namespace hal
 {
@@ -26,7 +25,7 @@ namespace hal
      * @brief 基于 FFmpeg + ALSA 的音频播放器
      *
      * 支持常见音频格式的解码播放，提供播放控制、音量调节、Seek 等功能。
-     * 使用独立解码线程避免阻塞调用方，通过智能指针管理 FFmpeg/ALSA 资源。
+     * 使用单控制线程串行处理命令，使用独立回调分发线程避免外部回调阻塞播放控制。
      *
      * @note 该类不可拷贝，同一实例一次只能播放一个文件
      */
@@ -123,15 +122,15 @@ namespace hal
 
         /**
          * @brief 设置播放完成回调
-         * @param callback 播放完成时调用的函数（在解码线程中执行）
-         * @note 回调函数应避免耗时操作，以免阻塞解码线程
+         * @param callback 播放完成时调用的函数（在回调分发线程中执行）
+         * @note 回调函数应避免长时间阻塞，建议将业务切回 UI/主线程
          */
         void setOnPlaybackComplete(PlaybackCallback callback);
 
         /**
          * @brief 设置错误回调
-         * @param callback 发生错误时调用的函数，参数为错误信息（在解码线程中执行）
-         * @note 回调函数应避免耗时操作，以免阻塞解码线程
+         * @param callback 发生错误时调用的函数，参数为错误信息（在回调分发线程中执行）
+         * @note 回调函数应避免长时间阻塞，建议将业务切回 UI/主线程
          */
         void setOnError(ErrorCallback callback);
 
@@ -144,66 +143,50 @@ namespace hal
         void setCpuAffinity(int cpuId);
 
     private:
-        static constexpr int kOutputChannels = 2;
-        static constexpr int kOutputSampleRate = 44100;
+        enum class CommandType : std::uint8_t
+        {
+            Play,
+            Stop,
+            Pause,
+            Resume,
+            Seek,
+            Shutdown
+        };
+
+        struct SyncToken
+        {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool done{false};
+            bool result{false};
+        };
+
+        struct Command
+        {
+            CommandType type{CommandType::Pause};
+            std::string filePath;
+            double seekPositionSeconds{0.0};
+            std::shared_ptr<SyncToken> sync;
+        };
 
         // --- 内部私有方法 ---
+        void controlLoop();
+        void processCommand(const Command& command);
+        void enqueueCommand(Command&& command);
+        bool enqueueAndWait(Command&& command, bool& result);
+        static void signalSyncResult(const std::shared_ptr<SyncToken>& sync, bool result);
+        [[nodiscard]] bool isOnControlThread() const;
 
-        /**
-         * @brief 打开音频文件并初始化 FFmpeg 解码器、重采样器、ALSA 输出
-         * @param filePath 音频文件路径
-         * @return true 初始化成功，false 失败
-         */
-        bool openFile(const std::string& filePath);
-
-        /**
-         * @brief 解码线程主循环，负责读取、解码、重采样、播放
-         */
-        void decodeLoop();
-
-        /**
-         * @brief 将解码后的音频帧重采样为目标格式
-         * @param frame 解码后的音频帧
-         * @param outBuffer 输出缓冲区指针（由调用方管理）
-         * @param outSamples 最大输出采样数
-         * @return 实际输出的采样数，<=0 表示失败
-         */
-        int convertFrameSamples(AVFrame* frame, uint8_t*& outBuffer, int outSamples) const;
-
-        /**
-         * @brief 对 PCM 数据应用软件音量控制
-         * @param outBuffer PCM 数据缓冲区（S16 格式）
-         * @param sampleCount 采样数（每个声道）
-         */
-        void applySoftwareVolume(uint8_t* outBuffer, int sampleCount) const;
-
-        /**
-         * @brief 将 PCM 数据写入 ALSA 设备
-         * @param outBuffer PCM 数据缓冲区
-         * @param sampleCount 采样数
-         * @note 写入失败时会自动尝试恢复 ALSA 设备
-         */
-        void writePcmSamples(uint8_t* outBuffer, int sampleCount);
-
-        /**
-         * @brief 根据音频帧时间戳更新当前播放进度
-         * @param frame 当前播放的音频帧
-         */
-        void updatePlaybackPosition(const AVFrame* frame);
-
-        /**
-         * @brief 处理单个音频包：解码、重采样、写入 ALSA
-         * @param packet 音频数据包
-         * @param frame 用于接收解码帧的缓冲区
-         * @param outBuffer 重采样输出缓冲区
-         * @param outSamples 最大输出采样数
-         */
-        void processAudioPacket(const AVPacket* packet, AVFrame* frame, uint8_t* outBuffer, int outSamples);
-
-        /**
-         * @brief 清理播放资源（重置状态，智能指针自动释放 FFmpeg/ALSA 资源）
-         */
-        void cleanup();
+        bool handlePlayCommand(const std::string& filePath);
+        void handleStopCommand();
+        void handlePauseCommand();
+        void handleResumeCommand();
+        bool handleSeekCommand(double positionSeconds);
+        void decodeOneStep();
+        void resetPlaybackResources();
+        void callbackLoop();
+        void postCallbackTask(std::function<void()> task);
+        void notifyPlaybackComplete();
 
         /**
          * @brief 线程安全地触发错误回调
@@ -211,61 +194,10 @@ namespace hal
          */
         void notifyError(const std::string& msg);
 
-        /**
-         * @brief 等待暂停状态解除或停止请求
-         * @return true 应继续播放，false 收到停止请求
-         */
-        bool waitForResumeOrStop();
-
-        /**
-         * @brief 唤醒等待中的解码线程（用于暂停/恢复控制）
-         */
-        void notifyPauseCondition();
-
-        // --- C++17: 自定义删除器，用于智能指针管理 FFmpeg/ALSA 资源 ---
-        template <typename T> struct FFmpegDeleter
-        {
-            void operator()(T* ptr) const noexcept
-            {
-                if constexpr (std::is_same_v<T, AVFormatContext>)
-                {
-                    if (ptr)
-                    {
-                        avformat_close_input(&ptr);
-                    }
-                }
-                else if constexpr (std::is_same_v<T, AVCodecContext>)
-                {
-                    if (ptr)
-                    {
-                        avcodec_free_context(&ptr);
-                    }
-                }
-                else if constexpr (std::is_same_v<T, SwrContext>)
-                {
-                    if (ptr)
-                    {
-                        swr_free(&ptr);
-                    }
-                }
-                else if constexpr (std::is_same_v<T, snd_pcm_t>)
-                {
-                    if (ptr)
-                    {
-                        snd_pcm_drain(ptr);
-                        snd_pcm_close(ptr);
-                    }
-                }
-            }
-        };
-
-        template <typename T> using FFmpegPtr = std::unique_ptr<T, FFmpegDeleter<T>>;
-
         // --- 成员变量 ---
-        // 状态控制 (原子操作，无需锁)
+        // 状态控制
         std::atomic<bool> m_isPlaying{false};
         std::atomic<bool> m_isPaused{false};
-        std::atomic<bool> m_stopRequested{false};
 
         // 音量
         std::atomic<float> m_volume{1.0F};
@@ -273,28 +205,34 @@ namespace hal
         // CPU亲和性设置
         int m_cpuAffinity{-1}; // -1表示使用默认CPU
 
-        // 解码线程
-        std::thread m_decodeThread;
+        // 单控制线程 + 命令队列
+        std::thread m_controlThread;
+        std::thread::id m_controlThreadId;
+        std::mutex m_commandMutex;
+        std::condition_variable m_commandCv;
+        std::deque<Command> m_commandQueue;
+        bool m_exitRequested{false};
 
-        // 暂停/恢复同步机制（替代轮询，提高实时性）
-        std::mutex m_pauseMutex;
-        std::condition_variable m_pauseCondition;
+        // 回调分发线程，防止控制线程被外部回调阻塞
+        std::thread m_callbackThread;
+        std::mutex m_callbackQueueMutex;
+        std::condition_variable m_callbackQueueCv;
+        std::deque<std::function<void()>> m_callbackQueue;
+        bool m_callbackExitRequested{false};
 
         // 回调保护 (涉及跨线程调用，需要锁)
         std::mutex m_callbackMutex;
         PlaybackCallback m_onComplete;
         ErrorCallback m_onError;
 
-        // --- FFmpeg 相关资源 (使用智能指针管理) ---
-        FFmpegPtr<AVFormatContext> m_formatCtx{nullptr};
-        FFmpegPtr<AVCodecContext> m_codecCtx{nullptr};
-        FFmpegPtr<SwrContext> m_swrCtx{nullptr};
-        int m_audioStreamIndex{-1};
-
-        // --- ALSA 相关资源 ---
-        FFmpegPtr<snd_pcm_t> m_pcmHandle{nullptr};
+        std::unique_ptr<AudioDecoder> m_decoder;
+        std::unique_ptr<AudioOutput> m_output;
 
         // 播放进度
         std::atomic<double> m_currentPts{0.0};
+        std::atomic<double> m_durationSeconds{0.0};
+        std::atomic<bool> m_hasDuration{false};
+
+        static constexpr std::chrono::milliseconds kSyncCommandTimeout{5000};
     };
 } // namespace hal

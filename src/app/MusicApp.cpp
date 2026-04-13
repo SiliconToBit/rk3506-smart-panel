@@ -1,7 +1,6 @@
 #include "app/MusicApp.h"
 #include "hal/AudioPlayer.h"
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -24,6 +23,11 @@ namespace app
     MusicApp::~MusicApp()
     {
         stop();
+        stopProgressTimer();
+        lv_async_call_cancel(asyncSongChangedThunk, this);
+        lv_async_call_cancel(asyncStateChangedThunk, this);
+        lv_async_call_cancel(asyncErrorThunk, this);
+        lv_async_call_cancel(asyncAutoNextThunk, this);
     }
 
     // ==========================================
@@ -40,7 +44,13 @@ namespace app
     // ==========================================
     int MusicApp::loadDirectory(const std::string& directoryPath)
     {
-        clearPlaylist();
+        std::vector<std::string> scannedPlaylist;
+        std::string currentSongPath;
+        const bool hasCurrentSong = (m_currentIndex >= 0 && m_currentIndex < static_cast<int>(m_playlist.size()));
+        if (hasCurrentSong)
+        {
+            currentSongPath = m_playlist[static_cast<size_t>(m_currentIndex)];
+        }
 
         try
         {
@@ -57,13 +67,25 @@ namespace app
                     std::string filePath = entry.path().string();
                     if (isAudioFile(filePath))
                     {
-                        m_playlist.push_back(filePath);
+                        scannedPlaylist.push_back(filePath);
                     }
                 }
             }
 
             // 按文件名排序
-            std::sort(m_playlist.begin(), m_playlist.end());
+            std::sort(scannedPlaylist.begin(), scannedPlaylist.end());
+
+            m_playlist = std::move(scannedPlaylist);
+            m_currentIndex = -1;
+
+            if (!currentSongPath.empty())
+            {
+                auto songIter = std::find(m_playlist.begin(), m_playlist.end(), currentSongPath);
+                if (songIter != m_playlist.end())
+                {
+                    m_currentIndex = static_cast<int>(songIter - m_playlist.begin());
+                }
+            }
 
             return static_cast<int>(m_playlist.size());
         }
@@ -76,7 +98,11 @@ namespace app
 
     void MusicApp::clearPlaylist()
     {
-        stop();
+        bool wasPlaying = m_audioPlayer->isPlaying();
+        if (wasPlaying)
+        {
+            m_audioPlayer->stop();
+        }
         m_playlist.clear();
         m_currentIndex = -1;
     }
@@ -130,8 +156,10 @@ namespace app
 
         if (success)
         {
+            loadLyricsForCurrentSong();
             notifySongChanged();
             notifyStateChanged(true);
+            notifyLyricChanged(0.0);
         }
 
         return success;
@@ -140,10 +168,10 @@ namespace app
     bool MusicApp::play(const std::string& filePath)
     {
         // 检查是否已在列表中
-        auto it = std::find(m_playlist.begin(), m_playlist.end(), filePath);
-        if (it != m_playlist.end())
+        auto songIter = std::find(m_playlist.begin(), m_playlist.end(), filePath);
+        if (songIter != m_playlist.end())
         {
-            return play(static_cast<int>(it - m_playlist.begin()));
+            return play(static_cast<int>(songIter - m_playlist.begin()));
         }
 
         // 添加到列表并播放
@@ -153,8 +181,10 @@ namespace app
         bool success = m_audioPlayer->play(filePath);
         if (success)
         {
+            loadLyricsForCurrentSong();
             notifySongChanged();
             notifyStateChanged(true);
+            notifyLyricChanged(0.0);
         }
 
         return success;
@@ -176,6 +206,22 @@ namespace app
     {
         m_audioPlayer->stop();
         notifyStateChanged(false);
+        {
+            std::lock_guard<std::mutex> lock(m_lyricMutex);
+            m_lyricParser.clear();
+            m_lastLyricText.clear();
+        }
+
+        LyricChangedCallback onLyricChanged;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            onLyricChanged = m_onLyricChanged;
+        }
+
+        if (onLyricChanged)
+        {
+            onLyricChanged("");
+        }
     }
 
     bool MusicApp::next()
@@ -210,6 +256,13 @@ namespace app
             return false;
         }
 
+        // 播放超过3秒时，按上一首回到当前歌曲开头
+        if (getCurrentPosition() > 3.0)
+        {
+            seek(0.0);
+            return true;
+        }
+
         int prevIndex = getPrevIndex();
         if (prevIndex < 0)
         {
@@ -229,7 +282,10 @@ namespace app
 
     void MusicApp::seek(double positionSeconds)
     {
-        m_audioPlayer->seek(positionSeconds);
+        if (m_audioPlayer->seek(positionSeconds))
+        {
+            notifyLyricChanged(positionSeconds);
+        }
     }
 
     // ==========================================
@@ -321,26 +377,33 @@ namespace app
         m_onError = std::move(callback);
     }
 
+    void MusicApp::setOnLyricChanged(LyricChangedCallback callback)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_onLyricChanged = std::move(callback);
+        }
+
+        notifyLyricChanged(getCurrentPosition());
+    }
+
     // ==========================================
     // 内部私有方法
     // ==========================================
     void MusicApp::setupAudioCallbacks()
     {
-        // 播放完成时自动播放下一首
+        // 播放完成后仅投递主线程任务，避免在解码线程直接切歌
         m_audioPlayer->setOnPlaybackComplete(
             [this]()
             {
-                if (m_playMode == PlayMode::SingleLoop)
+                if (m_autoNextPending.exchange(true))
                 {
-                    // 单曲循环，重新播放当前歌曲
-                    if (m_currentIndex >= 0)
-                    {
-                        play(m_currentIndex);
-                    }
+                    return;
                 }
-                else
+
+                if (lv_async_call(asyncAutoNextThunk, this) != LV_RES_OK)
                 {
-                    next();
+                    m_autoNextPending = false;
                 }
             });
 
@@ -350,10 +413,16 @@ namespace app
 
     void MusicApp::notifyProgressChanged()
     {
+        if (!isPlaying() || isPaused())
+        {
+            return;
+        }
+
         ProgressInfo info;
         info.currentPosition = getCurrentPosition();
         info.duration = getDuration();
         info.progressPercent = getProgressPercent();
+        notifyLyricChanged(info.currentPosition);
 
         std::lock_guard<std::mutex> lock(m_callbackMutex);
         if (m_onProgressChanged)
@@ -364,39 +433,215 @@ namespace app
 
     void MusicApp::notifySongChanged()
     {
-        std::lock_guard<std::mutex> lock(m_callbackMutex);
-        if (m_onSongChanged)
+        if (m_songChangedPending.exchange(true))
         {
-            m_onSongChanged(m_currentIndex, getCurrentSongName());
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_pendingSongMutex);
+            m_pendingSongData.index = m_currentIndex;
+            m_pendingSongData.songName = getCurrentSongName();
+        }
+
+        if (lv_async_call(asyncSongChangedThunk, this) != LV_RES_OK)
+        {
+            m_songChangedPending = false;
         }
     }
 
     void MusicApp::notifyStateChanged(bool playing)
     {
-        std::lock_guard<std::mutex> lock(m_callbackMutex);
-        if (m_onStateChanged)
+        if (m_lastNotifiedState.load() == playing)
         {
-            m_onStateChanged(playing);
+            return;
         }
+
+        if (m_stateChangedPending.exchange(true))
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_pendingStateMutex);
+            m_pendingStateData.isPlaying = playing;
+        }
+
+        if (lv_async_call(asyncStateChangedThunk, this) != LV_RES_OK)
+        {
+            m_stateChangedPending = false;
+            return;
+        }
+
+        m_lastNotifiedState = playing;
     }
 
     void MusicApp::notifyError(const std::string& msg)
     {
-        std::lock_guard<std::mutex> lock(m_callbackMutex);
-        if (m_onError)
+        if (m_errorPending.exchange(true))
         {
-            m_onError(msg);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_pendingErrorMutex);
+            m_pendingErrorData.errorMsg = msg;
+        }
+
+        if (lv_async_call(asyncErrorThunk, this) != LV_RES_OK)
+        {
+            m_errorPending = false;
+            std::cerr << "[MusicApp Error] " << msg << '\n';
+        }
+    }
+
+    void MusicApp::loadLyricsForCurrentSong()
+    {
+        std::lock_guard<std::mutex> lock(m_lyricMutex);
+        m_lyricParser.clear();
+        m_lastLyricText.clear();
+
+        if (m_currentIndex < 0 || m_currentIndex >= static_cast<int>(m_playlist.size()))
+        {
+            return;
+        }
+
+        m_lyricParser.loadForAudioFile(m_playlist[m_currentIndex]);
+    }
+
+    void MusicApp::notifyLyricChanged(double positionSeconds)
+    {
+        std::string lyricText;
+        {
+            std::lock_guard<std::mutex> lock(m_lyricMutex);
+            lyricText = m_lyricParser.getLyricAt(positionSeconds);
+            if (lyricText == m_lastLyricText)
+            {
+                return;
+            }
+            m_lastLyricText = lyricText;
+        }
+
+        LyricChangedCallback onLyricChanged;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            onLyricChanged = m_onLyricChanged;
+        }
+
+        if (onLyricChanged)
+        {
+            onLyricChanged(lyricText);
+        }
+    }
+
+    // ==========================================
+    // LVGL 异步回调 Thunk
+    // ==========================================
+    void MusicApp::asyncSongChangedThunk(void* userData)
+    {
+        auto* self = static_cast<MusicApp*>(userData);
+        self->m_songChangedPending = false;
+
+        int index;
+        std::string songName;
+        {
+            std::lock_guard<std::mutex> lock(self->m_pendingSongMutex);
+            index = self->m_pendingSongData.index;
+            songName = std::move(self->m_pendingSongData.songName);
+        }
+
+        std::lock_guard<std::mutex> lock(self->m_callbackMutex);
+        if (self->m_onSongChanged)
+        {
+            self->m_onSongChanged(index, songName);
+        }
+    }
+
+    void MusicApp::asyncStateChangedThunk(void* userData)
+    {
+        auto* self = static_cast<MusicApp*>(userData);
+        self->m_stateChangedPending = false;
+
+        bool isPlaying;
+        {
+            std::lock_guard<std::mutex> lock(self->m_pendingStateMutex);
+            isPlaying = self->m_pendingStateData.isPlaying;
+        }
+
+        std::lock_guard<std::mutex> lock(self->m_callbackMutex);
+        if (self->m_onStateChanged)
+        {
+            self->m_onStateChanged(isPlaying);
+        }
+    }
+
+    void MusicApp::asyncErrorThunk(void* userData)
+    {
+        auto* self = static_cast<MusicApp*>(userData);
+        self->m_errorPending = false;
+
+        std::string errorMsg;
+        {
+            std::lock_guard<std::mutex> lock(self->m_pendingErrorMutex);
+            errorMsg = std::move(self->m_pendingErrorData.errorMsg);
+        }
+
+        std::lock_guard<std::mutex> lock(self->m_callbackMutex);
+        if (self->m_onError)
+        {
+            self->m_onError(errorMsg);
         }
         else
         {
-            std::cerr << "[MusicApp Error] " << msg << std::endl;
+            std::cerr << "[MusicApp Error] " << errorMsg << '\n';
+        }
+    }
+
+    void MusicApp::asyncAutoNextThunk(void* userData)
+    {
+        auto* self = static_cast<MusicApp*>(userData);
+        self->m_autoNextPending = false;
+
+        if (self->m_playMode == PlayMode::SingleLoop)
+        {
+            if (self->m_currentIndex >= 0)
+            {
+                self->play(self->m_currentIndex);
+            }
+            return;
+        }
+
+        self->next();
+    }
+
+    void MusicApp::progressTimerCallback(lv_timer_t* timer)
+    {
+        auto* self = static_cast<MusicApp*>(timer->user_data);
+        self->notifyProgressChanged();
+    }
+
+    void MusicApp::startProgressTimer(uint32_t periodMs)
+    {
+        if (m_progressTimer != nullptr)
+        {
+            lv_timer_del(m_progressTimer);
+        }
+        m_progressTimer = lv_timer_create(progressTimerCallback, periodMs, this);
+    }
+
+    void MusicApp::stopProgressTimer()
+    {
+        if (m_progressTimer != nullptr)
+        {
+            lv_timer_del(m_progressTimer);
+            m_progressTimer = nullptr;
         }
     }
 
     std::string MusicApp::extractSongName(const std::string& filePath) const
     {
-        fs::path p(filePath);
-        std::string filename = p.filename().string();
+        fs::path path(filePath);
+        std::string filename = path.filename().string();
 
         // 移除扩展名
         size_t dotPos = filename.find_last_of('.');
@@ -413,8 +658,8 @@ namespace app
         static const std::vector<std::string> audioExtensions = {".mp3", ".wav", ".flac", ".aac",
                                                                  ".ogg", ".m4a", ".wma",  ".ape"};
 
-        fs::path p(filePath);
-        std::string ext = p.extension().string();
+        fs::path path(filePath);
+        std::string ext = path.extension().string();
 
         // 转换为小写
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -433,14 +678,13 @@ namespace app
         {
             case PlayMode::Shuffle:
             {
-                // 随机选择一个不同的索引
                 if (m_playlist.size() == 1)
                 {
                     return 0;
                 }
+                std::lock_guard<std::mutex> lock(m_rngMutex);
                 std::uniform_int_distribution<int> dist(0, static_cast<int>(m_playlist.size()) - 1);
                 int newIndex = dist(m_rng);
-                // 确保不是当前歌曲
                 while (newIndex == m_currentIndex)
                 {
                     newIndex = dist(m_rng);
@@ -455,7 +699,7 @@ namespace app
                 int nextIdx = m_currentIndex + 1;
                 if (nextIdx >= static_cast<int>(m_playlist.size()))
                 {
-                    return -1; // 已到末尾
+                    return -1;
                 }
                 return nextIdx;
             }
@@ -473,7 +717,7 @@ namespace app
         {
             case PlayMode::Shuffle:
             {
-                // 随机选择
+                std::lock_guard<std::mutex> lock(m_rngMutex);
                 std::uniform_int_distribution<int> dist(0, static_cast<int>(m_playlist.size()) - 1);
                 return dist(m_rng);
             }
@@ -485,7 +729,7 @@ namespace app
                 int prevIdx = m_currentIndex - 1;
                 if (prevIdx < 0)
                 {
-                    return -1; // 已在开头
+                    return -1;
                 }
                 return prevIdx;
             }

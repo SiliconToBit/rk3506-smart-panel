@@ -70,6 +70,13 @@ aux_source_directory(${PROJECT_SOURCE_DIR}/src/hal SRCS)
 aux_source_directory(${PROJECT_SOURCE_DIR}/src/sensor SRCS)
 aux_source_directory(${PROJECT_SOURCE_DIR}/src/ui SRCS)
 
+# 显式追加音频模块拆分后的源文件（避免旧缓存未重新收集到新文件）
+list(APPEND SRCS
+    ${PROJECT_SOURCE_DIR}/src/hal/AudioDecoder.cpp
+    ${PROJECT_SOURCE_DIR}/src/hal/AudioOutput.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/LyricParser.cpp
+)
+
 # 主程序入口
 list(APPEND SRCS ${PROJECT_SOURCE_DIR}/src/main.cpp)
 
@@ -108,7 +115,7 @@ add_custom_target(distclean
 
 # --- 编译选项 ---
 # 设为 OFF 可在无开发板时编译（跳过自动部署）
-option(ENABLE_AUTO_DEPLOY "Enable auto-deploy to target board" OFF)
+option(ENABLE_AUTO_DEPLOY "Enable auto-deploy to target board" ON)
 
 # --- 安装配置 ---
 set(OVERLAY_ROOT_DIR $ENV{RK3506_OVERLAY_DIR})
@@ -124,7 +131,7 @@ install(TARGETS ${PROJECT_NAME}
 # --- 自动传输到开发板 ---
 if(ENABLE_AUTO_DEPLOY)
     # 配置目标开发板 IP 和密码
-    set(TARGET_IP "192.168.5.71")
+    set(TARGET_IP "192.168.5.87")
     set(TARGET_USER "root")
     set(TARGET_PATH "/root")
     set(TARGET_PASS "luckfox")

@@ -1,11 +1,19 @@
 #pragma once
 
-#include <string>
-#include <vector>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
+#include <vector>
+
+#include "app/LyricParser.h"
+
+extern "C"
+{
+#include "lvgl.h"
+}
 
 namespace hal
 {
@@ -282,28 +290,57 @@ namespace app
         using ErrorCallback = std::function<void(const std::string& errorMsg)>;
 
         /**
+         * @brief 歌词变化回调类型
+         * @param lyric 当前歌词行文本
+         */
+        using LyricChangedCallback = std::function<void(const std::string& lyric)>;
+
+        /**
          * @brief 设置进度变化回调
          * @param callback 回调函数
+         * @note 回调在 LVGL 线程中执行，可安全操作 LVGL 控件
          */
         void setOnProgressChanged(ProgressCallback callback);
 
         /**
          * @brief 设置歌曲切换回调
          * @param callback 回调函数
+         * @note 回调在 LVGL 线程中执行，可安全操作 LVGL 控件
          */
         void setOnSongChanged(SongChangedCallback callback);
 
         /**
          * @brief 设置播放状态变化回调
          * @param callback 回调函数
+         * @note 回调在 LVGL 线程中执行，可安全操作 LVGL 控件
          */
         void setOnStateChanged(StateChangedCallback callback);
 
         /**
          * @brief 设置错误回调
          * @param callback 回调函数
+         * @note 回调在 LVGL 线程中执行，可安全操作 LVGL 控件
          */
         void setOnError(ErrorCallback callback);
+
+        /**
+         * @brief 设置歌词变化回调
+         * @param callback 回调函数
+         * @note 回调在 LVGL 线程中执行，可安全操作 LVGL 控件
+         */
+        void setOnLyricChanged(LyricChangedCallback callback);
+
+        /**
+         * @brief 启动进度更新定时器（需在 LVGL 初始化后调用）
+         * @param periodMs 更新周期（毫秒），默认 500ms
+         * @note 此方法必须在 LVGL 线程中调用
+         */
+        void startProgressTimer(uint32_t periodMs = 500);
+
+        /**
+         * @brief 停止进度更新定时器
+         */
+        void stopProgressTimer();
 
     private:
         MusicApp();
@@ -319,20 +356,63 @@ namespace app
         void notifySongChanged();
         void notifyStateChanged(bool playing);
         void notifyError(const std::string& msg);
+        void loadLyricsForCurrentSong();
+        void notifyLyricChanged(double positionSeconds);
         std::string extractSongName(const std::string& filePath) const;
         bool isAudioFile(const std::string& filePath) const;
         int getNextIndex() const;
         int getPrevIndex() const;
 
+        // LVGL 异步回调 Thunk（静态函数，适配 lv_async_call）
+        static void asyncSongChangedThunk(void* userData);
+        static void asyncStateChangedThunk(void* userData);
+        static void asyncErrorThunk(void* userData);
+        static void asyncAutoNextThunk(void* userData);
+        static void progressTimerCallback(lv_timer_t* timer);
+
         // 成员变量
         std::unique_ptr<hal::AudioPlayer> m_audioPlayer;
         std::vector<std::string> m_playlist;
         int m_currentIndex = -1;
-        PlayMode m_playMode = PlayMode::Sequence;
+        PlayMode m_playMode = PlayMode::Loop;
         float m_volume = 1.0f;
 
         // 随机播放用（mutable 允许在 const 方法中修改）
         mutable std::mt19937 m_rng;
+        mutable std::mutex m_rngMutex; // 保护 m_rng 的线程安全
+
+        // 进度定时器
+        lv_timer_t* m_progressTimer = nullptr;
+
+        // LVGL 异步调用 pending 标志（防止重复调度）
+        std::atomic<bool> m_songChangedPending{false};
+        std::atomic<bool> m_stateChangedPending{false};
+        std::atomic<bool> m_errorPending{false};
+        std::atomic<bool> m_autoNextPending{false};
+
+        // 待传递的数据（在异步回调执行前有效）
+        struct PendingSongData
+        {
+            int index = -1;
+            std::string songName;
+        };
+        PendingSongData m_pendingSongData;
+        std::mutex m_pendingSongMutex;
+
+        struct PendingStateData
+        {
+            bool isPlaying = false;
+        };
+        PendingStateData m_pendingStateData;
+        std::mutex m_pendingStateMutex;
+        std::atomic<bool> m_lastNotifiedState{false};
+
+        struct PendingErrorData
+        {
+            std::string errorMsg;
+        };
+        PendingErrorData m_pendingErrorData;
+        std::mutex m_pendingErrorMutex;
 
         // 回调
         std::mutex m_callbackMutex;
@@ -340,6 +420,11 @@ namespace app
         SongChangedCallback m_onSongChanged;
         StateChangedCallback m_onStateChanged;
         ErrorCallback m_onError;
+        LyricChangedCallback m_onLyricChanged;
+
+        std::mutex m_lyricMutex;
+        LyricParser m_lyricParser;
+        std::string m_lastLyricText;
     };
 
 } // namespace app
