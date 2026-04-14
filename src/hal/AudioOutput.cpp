@@ -103,6 +103,22 @@ namespace hal
         return m_impl->pcmHandle != nullptr && m_impl->channels > 0;
     }
 
+    int AudioOutput::getDelayFrames() const
+    {
+        if (!isOpen())
+        {
+            return 0;
+        }
+
+        snd_pcm_sframes_t delay = 0;
+        if (snd_pcm_delay(m_impl->pcmHandle.get(), &delay) < 0)
+        {
+            return 0;
+        }
+
+        return static_cast<int>(delay);
+    }
+
     void AudioOutput::flush()
     {
         if (!isOpen())

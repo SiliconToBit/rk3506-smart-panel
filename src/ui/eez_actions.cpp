@@ -92,9 +92,10 @@ namespace
 
         auto& musicApp = app::MusicApp::getInstance();
         const int requestedIndex = *indexPtr;
-        if (musicApp.play(requestedIndex))
+        const bool shouldAutoplay = musicApp.isPlaying() && !musicApp.isPaused();
+        if (musicApp.play(requestedIndex, shouldAutoplay))
         {
-            sync_play_pause_button_state(true);
+            sync_play_pause_button_state(shouldAutoplay);
             set_current_song_highlight(requestedIndex, true);
             return;
         }
@@ -247,7 +248,8 @@ extern "C"
                 {
                     lv_label_set_text(objects.music_title_label, songName.c_str());
                 }
-                sync_play_pause_button_state(true);
+                auto& musicApp = app::MusicApp::getInstance();
+                sync_play_pause_button_state(musicApp.isPlaying() && !musicApp.isPaused());
                 set_current_song_highlight(index, true);
                 printf("[Music] Song changed: [%d] %s\n", index, songName.c_str());
             });

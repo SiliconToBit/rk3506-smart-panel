@@ -284,6 +284,7 @@ namespace hal
 
         while (true)
         {
+            // 步骤 A：尝试从解码器获取已解码帧
             const int receiveRet = avcodec_receive_frame(m_impl->codecCtx.get(), m_impl->frame.get());
             if (receiveRet == 0)
             {
@@ -322,59 +323,63 @@ namespace hal
 
             if (receiveRet == AVERROR_EOF)
             {
+                // 解码器内部缓冲已全部排空
                 return false;
             }
 
             if (receiveRet != AVERROR(EAGAIN))
             {
-                errorMsg = "avcodec_receive_frame failed";
+                char errBuf[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(receiveRet, errBuf, sizeof(errBuf));
+                errorMsg = "avcodec_receive_frame failed: " + std::string(errBuf);
                 return false;
             }
 
-            if (!m_impl->drainSent)
+            // receive_frame 返回 EAGAIN：解码器需要更多输入数据
+            if (m_impl->drainSent)
             {
-                const int readRet = av_read_frame(m_impl->formatCtx.get(), m_impl->packet.get());
-                if (readRet < 0)
-                {
-                    const int drainRet = avcodec_send_packet(m_impl->codecCtx.get(), nullptr);
-                    if (drainRet == AVERROR(EAGAIN))
-                    {
-                        continue;
-                    }
+                // drain 已发送但解码器仍要求更多数据 → 确认无残留帧
+                return false;
+            }
 
-                    if (drainRet < 0)
-                    {
-                        errorMsg = "Failed to drain decoder";
-                        return false;
-                    }
-                    m_impl->drainSent = true;
-                    continue;
-                }
-
-                if (m_impl->packet->stream_index != m_impl->audioStreamIndex)
+            // 步骤 B：读取下一个数据包并发送给解码器
+            const int readRet = av_read_frame(m_impl->formatCtx.get(), m_impl->packet.get());
+            if (readRet < 0)
+            {
+                // 文件已读完，发送 drain 信号
+                const int drainRet = avcodec_send_packet(m_impl->codecCtx.get(), nullptr);
+                if (drainRet < 0 && drainRet != AVERROR(EAGAIN))
                 {
-                    av_packet_unref(m_impl->packet.get());
-                    continue;
-                }
-
-                const int sendRet = avcodec_send_packet(m_impl->codecCtx.get(), m_impl->packet.get());
-                if (sendRet == AVERROR(EAGAIN))
-                {
-                    av_packet_unref(m_impl->packet.get());
-                    continue;
-                }
-
-                if (sendRet < 0)
-                {
-                    av_packet_unref(m_impl->packet.get());
-                    errorMsg = "avcodec_send_packet failed";
+                    char errBuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_strerror(drainRet, errBuf, sizeof(errBuf));
+                    errorMsg = "Failed to drain decoder: " + std::string(errBuf);
                     return false;
                 }
+                m_impl->drainSent = true;
+                continue;
+            }
+
+            if (m_impl->packet->stream_index != m_impl->audioStreamIndex)
+            {
                 av_packet_unref(m_impl->packet.get());
                 continue;
             }
 
-            return false;
+            const int sendRet = avcodec_send_packet(m_impl->codecCtx.get(), m_impl->packet.get());
+            av_packet_unref(m_impl->packet.get());
+            if (sendRet == AVERROR(EAGAIN))
+            {
+                // 解码器内部队列满，需要输出帧，继续尝试 receive_frame
+                continue;
+            }
+
+            if (sendRet < 0)
+            {
+                char errBuf[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(sendRet, errBuf, sizeof(errBuf));
+                errorMsg = "avcodec_send_packet failed: " + std::string(errBuf);
+                return false;
+            }
         }
     }
 } // namespace hal

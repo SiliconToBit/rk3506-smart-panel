@@ -145,20 +145,41 @@ namespace app
     // ==========================================
     bool MusicApp::play(int index)
     {
+        return play(index, true);
+    }
+
+    bool MusicApp::play(int index, bool startPlaying)
+    {
         if (index < 0 || index >= static_cast<int>(m_playlist.size()))
         {
             notifyError("Invalid playlist index");
             return false;
         }
 
+        // 重置 pending 标志，确保新歌曲的回调不会被旧标志跳过
+        m_songChangedPending = false;
+        m_stateChangedPending = false;
+
         m_currentIndex = index;
-        bool success = m_audioPlayer->play(m_playlist[index]);
+        bool success;
+        if (startPlaying)
+        {
+            success = m_audioPlayer->play(m_playlist[index]);
+        }
+        else
+        {
+            if (m_audioPlayer->isPlaying())
+            {
+                m_audioPlayer->stop();
+            }
+            success = true;
+        }
 
         if (success)
         {
             loadLyricsForCurrentSong();
             notifySongChanged();
-            notifyStateChanged(true);
+            notifyStateChanged(startPlaying);
             notifyLyricChanged(0.0);
         }
 
@@ -177,6 +198,10 @@ namespace app
         // 添加到列表并播放
         m_playlist.push_back(filePath);
         m_currentIndex = static_cast<int>(m_playlist.size()) - 1;
+
+        // 重置 pending 标志
+        m_songChangedPending = false;
+        m_stateChangedPending = false;
 
         bool success = m_audioPlayer->play(filePath);
         if (success)
@@ -246,7 +271,8 @@ namespace app
             }
         }
 
-        return play(nextIndex);
+        const bool shouldAutoplay = isPlaying() && !isPaused();
+        return play(nextIndex, shouldAutoplay);
     }
 
     bool MusicApp::prev()
@@ -277,7 +303,8 @@ namespace app
             }
         }
 
-        return play(prevIndex);
+        const bool shouldAutoplay = isPlaying() && !isPaused();
+        return play(prevIndex, shouldAutoplay);
     }
 
     void MusicApp::seek(double positionSeconds)
@@ -499,7 +526,8 @@ namespace app
     {
         std::lock_guard<std::mutex> lock(m_lyricMutex);
         m_lyricParser.clear();
-        m_lastLyricText.clear();
+        // 不在此处清空 m_lastLyricText，由 notifyLyricChanged 负责更新
+        // 这样可以确保即使新歌曲没有歌词，也能触发回调清空 UI
 
         if (m_currentIndex < 0 || m_currentIndex >= static_cast<int>(m_playlist.size()))
         {
@@ -512,14 +540,20 @@ namespace app
     void MusicApp::notifyLyricChanged(double positionSeconds)
     {
         std::string lyricText;
+        bool shouldNotify = false;
         {
             std::lock_guard<std::mutex> lock(m_lyricMutex);
             lyricText = m_lyricParser.getLyricAt(positionSeconds);
-            if (lyricText == m_lastLyricText)
+            if (lyricText != m_lastLyricText)
             {
-                return;
+                m_lastLyricText = lyricText;
+                shouldNotify = true;
             }
-            m_lastLyricText = lyricText;
+        }
+
+        if (!shouldNotify)
+        {
+            return;
         }
 
         LyricChangedCallback onLyricChanged;
@@ -640,17 +674,7 @@ namespace app
 
     std::string MusicApp::extractSongName(const std::string& filePath) const
     {
-        fs::path path(filePath);
-        std::string filename = path.filename().string();
-
-        // 移除扩展名
-        size_t dotPos = filename.find_last_of('.');
-        if (dotPos != std::string::npos)
-        {
-            filename = filename.substr(0, dotPos);
-        }
-
-        return filename;
+        return fs::path(filePath).stem().string();
     }
 
     bool MusicApp::isAudioFile(const std::string& filePath) const

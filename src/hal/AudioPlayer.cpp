@@ -168,8 +168,15 @@ namespace hal
                 {
                     if (m_isPlaying.load() && !m_isPaused.load())
                     {
-                        m_commandCv.wait_for(lock, std::chrono::milliseconds(2),
-                                             [this]() { return !m_commandQueue.empty(); });
+                        // 播放中：根据 ALSA 缓冲区延迟动态调整等待时间
+                        // 延迟越大说明缓冲区越满，等待越久以减缓解码速率
+                        const int delayFrames = m_output ? m_output->getDelayFrames() : 0;
+                        const double delaySeconds = static_cast<double>(delayFrames) / AudioDecoder::kOutputSampleRate;
+                        // 目标：保持约 100ms 的缓冲区，避免过大或过小
+                        constexpr double kTargetDelay = 0.1;
+                        auto waitMs =
+                            delaySeconds > kTargetDelay ? std::chrono::milliseconds(10) : std::chrono::milliseconds(2);
+                        m_commandCv.wait_for(lock, waitMs, [this]() { return !m_commandQueue.empty(); });
                     }
                     else
                     {
@@ -348,8 +355,13 @@ namespace hal
 
     void AudioPlayer::handlePauseCommand()
     {
-        if (m_isPlaying.load())
+        if (m_isPlaying.load() && !m_isPaused.load())
         {
+            // 立即丢弃 ALSA 缓冲区中未播放的数据，实现即时暂停
+            if (m_output)
+            {
+                m_output->flush();
+            }
             m_isPaused = true;
         }
     }
@@ -417,7 +429,11 @@ namespace hal
             return;
         }
 
-        m_currentPts = ptsSeconds;
+        // 根据 ALSA 缓冲区延迟修正 PTS，避免进度显示比实际播放快
+        const int delayFrames = m_output->getDelayFrames();
+        const double delaySeconds = static_cast<double>(delayFrames) / AudioDecoder::kOutputSampleRate;
+        const double correctedPts = ptsSeconds - delaySeconds;
+        m_currentPts = correctedPts > 0.0 ? correctedPts : 0.0;
     }
 
     void AudioPlayer::resetPlaybackResources()

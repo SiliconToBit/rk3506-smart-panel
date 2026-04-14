@@ -86,6 +86,14 @@ namespace hal
         [[nodiscard]] bool isOpen() const;
 
         /**
+         * @brief 获取 ALSA 缓冲区中尚未播放的帧数
+         * @return 延迟帧数，如果设备未打开则返回 0
+         *
+         * 可用于计算实际播放进度，考虑 ALSA 内部缓冲区的延迟。
+         */
+        [[nodiscard]] int getDelayFrames() const;
+
+        /**
          * @brief 清空输出缓冲并重新准备设备
          *
          * 丢弃 ALSA 缓冲区中未播放的数据，并重新准备设备。

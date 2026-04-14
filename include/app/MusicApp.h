@@ -143,6 +143,14 @@ namespace app
         bool play(int index);
 
         /**
+         * @brief 播放指定索引的歌曲，可选择是否立即开始播放
+         * @param index 播放列表索引
+         * @param startPlaying true 立即播放，false 仅切换歌曲并保持非播放状态
+         * @return 是否成功切换或播放
+         */
+        bool play(int index, bool startPlaying);
+
+        /**
          * @brief 播放指定路径的文件（自动添加到列表）
          * @param filePath 文件完整路径
          * @return 是否成功开始播放
