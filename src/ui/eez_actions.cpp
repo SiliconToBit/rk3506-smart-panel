@@ -8,11 +8,17 @@
 #include "actions.h"
 #include "screens.h"
 #include "fonts.h"
+#include "images.h"
 #include "app/WeatherApp.h"
 #include "app/CityData.h"
 #include "hal/HttpClient.h"
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 // 前向声明 objects 结构体（由 screens.c 定义）
@@ -20,10 +26,182 @@ extern _objects_t objects;
 
 namespace
 {
+    namespace fs = std::filesystem;
+
     // Keep stable per-item indices for LVGL event user_data pointers.
     std::vector<int> g_musicListIndices;
     // Keep button handles to support highlight/auto-scroll by song index.
     std::vector<lv_obj_t*> g_musicListButtons;
+    // Keep file src storage alive for lv_img_set_src(file path).
+    std::string g_albumArtFileSrc;
+
+    std::string trim_ascii_whitespace(const std::string& text)
+    {
+        size_t begin = 0;
+        while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0)
+        {
+            ++begin;
+        }
+
+        size_t end = text.size();
+        while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0)
+        {
+            --end;
+        }
+
+        return text.substr(begin, end - begin);
+    }
+
+    bool has_image_extension(const fs::path& imagePath)
+    {
+        std::string ext = imagePath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png";
+    }
+
+    void append_cover_candidates(std::vector<std::string>& candidates, const fs::path& dirPath,
+                                 const std::string& baseName)
+    {
+        if (baseName.empty())
+        {
+            return;
+        }
+
+        static const std::array<const char*, 3> kImageExts = {".jpg", ".jpeg", ".png"};
+        for (const char* ext : kImageExts)
+        {
+            candidates.push_back((dirPath / (baseName + ext)).string());
+        }
+    }
+
+    std::string find_cover_path_for_audio(const std::string& audioPath)
+    {
+        const fs::path songPath(audioPath);
+        const fs::path dirPath = songPath.parent_path();
+        const std::string stem = songPath.stem().string();
+
+        std::vector<std::string> candidates;
+        candidates.reserve(16);
+        append_cover_candidates(candidates, dirPath, stem);
+
+        static const std::array<const char*, 5> kSeparators = {" - ", "-", "_", "—", "–"};
+        for (const char* separator : kSeparators)
+        {
+            const std::string sep(separator);
+            const size_t pos = stem.find(sep);
+            if (pos == std::string::npos)
+            {
+                continue;
+            }
+
+            const std::string left = trim_ascii_whitespace(stem.substr(0, pos));
+            const std::string right = trim_ascii_whitespace(stem.substr(pos + sep.size()));
+            append_cover_candidates(candidates, dirPath, left);
+            append_cover_candidates(candidates, dirPath, right);
+        }
+
+        for (const std::string& candidate : candidates)
+        {
+            std::error_code ec;
+            if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec))
+            {
+                return candidate;
+            }
+        }
+
+        std::error_code ec;
+        if (!fs::exists(dirPath, ec) || !fs::is_directory(dirPath, ec))
+        {
+            return "";
+        }
+
+        for (const auto& entry : fs::directory_iterator(dirPath, ec))
+        {
+            if (ec)
+            {
+                break;
+            }
+
+            if (!entry.is_regular_file(ec) || ec)
+            {
+                continue;
+            }
+
+            const fs::path candidatePath = entry.path();
+            if (!has_image_extension(candidatePath))
+            {
+                continue;
+            }
+
+            const std::string imageStem = candidatePath.stem().string();
+            if (imageStem.empty())
+            {
+                continue;
+            }
+
+            if (stem.find(imageStem) != std::string::npos || imageStem.find(stem) != std::string::npos)
+            {
+                return candidatePath.string();
+            }
+        }
+
+        return "";
+    }
+
+    bool update_album_art_for_current_song()
+    {
+        if (objects.music_album_img == nullptr)
+        {
+            return false;
+        }
+
+        auto& musicApp = app::MusicApp::getInstance();
+        const int currentIndex = musicApp.getCurrentIndex();
+        const std::vector<std::string> playlist = musicApp.getPlaylist();
+        if (currentIndex < 0 || currentIndex >= static_cast<int>(playlist.size()))
+        {
+            lv_img_set_src(objects.music_album_img, &img_music_image);
+            lv_obj_invalidate(objects.music_album_img);
+            return false;
+        }
+
+        const std::string coverPath = find_cover_path_for_audio(playlist[static_cast<size_t>(currentIndex)]);
+        if (coverPath.empty())
+        {
+            lv_img_set_src(objects.music_album_img, &img_music_image);
+            lv_obj_invalidate(objects.music_album_img);
+            return false;
+        }
+
+        // Build fs source path based on LVGL configured driver letter.
+        char fsLetter = '\0';
+#if LV_USE_FS_POSIX
+        fsLetter = static_cast<char>(LV_FS_POSIX_LETTER);
+#elif LV_USE_FS_STDIO
+        fsLetter = static_cast<char>(LV_FS_STDIO_LETTER);
+#endif
+
+        if (fsLetter == '\0' || fsLetter == '/')
+        {
+            g_albumArtFileSrc = coverPath;
+        }
+        else
+        {
+            g_albumArtFileSrc = std::string(1, fsLetter) + ":" + coverPath;
+        }
+
+        lv_img_header_t header;
+        if (lv_img_decoder_get_info(g_albumArtFileSrc.c_str(), &header) != LV_RES_OK)
+        {
+            lv_img_set_src(objects.music_album_img, &img_music_image);
+            lv_obj_invalidate(objects.music_album_img);
+            return false;
+        }
+
+        lv_img_set_src(objects.music_album_img, g_albumArtFileSrc.c_str());
+        lv_obj_invalidate(objects.music_album_img);
+        return true;
+    }
 
     void set_current_song_highlight(int activeIndex, bool autoScroll)
     {
@@ -163,6 +341,7 @@ extern "C"
         int count = musicApp.loadDirectory("/root/Music");
         printf("[Music] Loaded %d songs from /root/Music\n", count);
         rebuild_music_song_list_ui();
+        update_album_art_for_current_song();
     }
 
     void action_toggle_play_pause(lv_event_t* e)
@@ -215,7 +394,9 @@ extern "C"
 
     void action_update_album_art(lv_event_t* e)
     {
-        // 专辑封面由 onSongChanged 回调处理
+        (void) e;
+        const bool updated = update_album_art_for_current_song();
+        printf("[Music] Album art refresh: %s\n", updated ? "matched cover" : "fallback default");
     }
 
     void action_init_music_screen(lv_event_t* e)
@@ -240,6 +421,8 @@ extern "C"
             lv_label_set_text(objects.music_lyrics_label, "");
         }
 
+        update_album_art_for_current_song();
+
         // 设置歌曲切换回调
         musicApp.setOnSongChanged(
             [](int index, const std::string& songName)
@@ -251,6 +434,7 @@ extern "C"
                 auto& musicApp = app::MusicApp::getInstance();
                 sync_play_pause_button_state(musicApp.isPlaying() && !musicApp.isPaused());
                 set_current_song_highlight(index, true);
+                update_album_art_for_current_song();
                 printf("[Music] Song changed: [%d] %s\n", index, songName.c_str());
             });
 
